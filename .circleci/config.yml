@@ -1,0 +1,76 @@
+---
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@0.1.13
+
+jobs:
+  initialize-workspace:
+    docker:
+      - image: circleci/openjdk:8-jdk
+    steps:
+      - checkout
+      - aws-cli/install
+      - aws-cli/configure:
+          profile-name: default
+          aws-access-key-id: AWS_ACCESS_KEY_ID
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY
+          aws-region: AWS_REGION
+      - persist_to_workspace:
+          root: ~/.aws
+          paths:
+            - "*"
+  do-patches:
+    docker:
+      - image: circleci/python:latest
+    steps:
+      - attach_workspace:
+          at: ~/.aws
+      - aws-cli/install
+      - run: |
+          mkdir ~/.ssh
+          chmod 700 ~/.ssh
+          aws ec2 delete-key-pair --key-name "patches-keypair"  || :
+          aws ec2 create-key-pair --key-name "patches-keypair" \
+                                  --output json | \
+                                  jq -r '.KeyMaterial' | \
+                                  tee ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          aws ec2 delete-security-group --group-name "patches-allow-ssh"  || :
+          export SECURITY_GROUP_ID=$(aws ec2 create-security-group --group-name "patches-allow-ssh" \
+                                                                   --description "patches-allow-ssh" \
+                                                                   --query 'GroupId' \
+                                                                   --output text)
+          aws ec2 authorize-security-group-ingress --group-id $SECURITY_GROUP_ID \
+                                                   --port 22 \
+                                                   --protocol tcp \
+                                                   --cidr "0.0.0.0/0"
+          export AMI_ID=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 \
+                                                 --query 'Parameters[0].[Value]' \
+                                                 --output text)
+          export INSTANCE_ID=$(aws ec2 run-instances --image-id $AMI_ID \
+                                                     --instance-type t3.micro \
+                                                     --count 1 \
+                                                     --security-group-ids $SECURITY_GROUP_ID \
+                                                     --query 'Instances[0].InstanceId' \
+                                                     --output text)
+          export INSTANCE_ADDRESS=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+                                     --query 'Reservations[0].Instances[0].PublicIpAddress' \
+                                     --output text)
+          ssh -oStrictHostKeyChecking=no $INSTANCE_ADDRESS hostname
+
+          # Cleanup
+          aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+          aws ec2 delete-key-pair --key-name "patches-keypair"
+          aws ec2 delete-security-group --group-id $SECURITY_GROUP_ID
+
+workflows:
+  release:
+    jobs:
+      - initialize-workspace:
+          context: vdo
+      - do-patches:
+          requires:
+            - initialize-workspace
+          context: vdo
+
